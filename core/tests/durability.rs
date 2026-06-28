@@ -1,8 +1,13 @@
-//! ROADMAP S2 exit criteria, as runnable checks (the 03:00-pager-drill seeds).
+//! ROADMAP S2/S3 exit criteria, as runnable checks (the 03:00-pager-drill seeds).
 //! Each test fails if a core trust invariant breaks.
 
 use ssn_core::*;
 use std::io::Write;
+
+/// Fixed key so reopening the same store in a test uses the same key.
+fn test_key() -> SymKey {
+    SymKey::from_bytes([7u8; 32])
+}
 
 fn op(payload: Payload) -> OperationEnvelope {
     OperationEnvelope::seal(EnvelopeCore {
@@ -55,13 +60,13 @@ fn local_save_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let ops = sample_ops();
     {
-        let mut s = LocalStore::open(dir.path()).unwrap();
+        let mut s = LocalStore::open(dir.path(), test_key()).unwrap();
         for o in &ops {
             assert!(s.commit(o).unwrap());
         }
     } // drop = simulated process exit
 
-    let s2 = LocalStore::open(dir.path()).unwrap();
+    let s2 = LocalStore::open(dir.path(), test_key()).unwrap();
     assert_eq!(s2.ops().len(), ops.len());
 
     let state = replay(s2.ops());
@@ -89,7 +94,7 @@ fn replay_is_deterministic() {
 fn outbox_is_distinct_from_durability() {
     let dir = tempfile::tempdir().unwrap();
     let ops = sample_ops();
-    let mut s = LocalStore::open(dir.path()).unwrap();
+    let mut s = LocalStore::open(dir.path(), test_key()).unwrap();
     for o in &ops {
         s.commit(o).unwrap();
     }
@@ -104,7 +109,7 @@ fn outbox_is_distinct_from_durability() {
     );
 
     drop(s);
-    let s2 = LocalStore::open(dir.path()).unwrap();
+    let s2 = LocalStore::open(dir.path(), test_key()).unwrap();
     assert_eq!(s2.outbox_len(), ops.len() - 1, "ack must persist");
 }
 
@@ -116,30 +121,65 @@ fn commit_is_idempotent() {
         workspace: WorkspaceId::new("w"),
         name: "x".into(),
     });
-    let mut s = LocalStore::open(dir.path()).unwrap();
+    let mut s = LocalStore::open(dir.path(), test_key()).unwrap();
     assert!(s.commit(&o).unwrap());
     assert!(!s.commit(&o).unwrap());
     assert_eq!(s.ops().len(), 1);
 }
 
-/// A tampered (but still valid-JSON) log line is detected, not silently trusted.
+/// S3: the on-disk op log contains no plaintext.
+#[test]
+fn no_plaintext_at_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = LocalStore::open(dir.path(), test_key()).unwrap();
+    for o in &sample_ops() {
+        s.commit(o).unwrap();
+    }
+    let raw = std::fs::read(dir.path().join("ops.jsonl")).unwrap();
+    for needle in [&b"Home"[..], b"hello", b"HELLO", b"world", b"Note"] {
+        assert!(
+            !raw.windows(needle.len()).any(|w| w == needle),
+            "plaintext leaked at rest"
+        );
+    }
+}
+
+/// S3: a store written under one key cannot be opened (decrypted) under another.
+#[test]
+fn wrong_key_cannot_open_store() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut s = LocalStore::open(dir.path(), SymKey::from_bytes([1u8; 32])).unwrap();
+        for o in &sample_ops() {
+            s.commit(o).unwrap();
+        }
+    }
+    let err = LocalStore::open(dir.path(), SymKey::from_bytes([2u8; 32])).unwrap_err();
+    assert!(matches!(err, StoreError::Corruption(_)));
+}
+
+/// A tampered ciphertext line is detected by the AEAD tag, not silently trusted.
 #[test]
 fn tamper_is_detected_on_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let ops = sample_ops();
     {
-        let mut s = LocalStore::open(dir.path()).unwrap();
+        let mut s = LocalStore::open(dir.path(), test_key()).unwrap();
         for o in &ops {
             s.commit(o).unwrap();
         }
     }
+    // Flip one hex nibble in the first (non-final) ciphertext line.
     let log = dir.path().join("ops.jsonl");
     let content = std::fs::read_to_string(&log).unwrap();
     let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-    lines[0] = lines[0].replacen("Home", "Hom3", 1); // non-final line, valid JSON, wrong hash
+    let mut chars: Vec<char> = lines[0].chars().collect();
+    let pos = chars.len() / 2;
+    chars[pos] = if chars[pos] == 'a' { 'b' } else { 'a' };
+    lines[0] = chars.into_iter().collect();
     std::fs::write(&log, lines.join("\n") + "\n").unwrap();
 
-    let err = LocalStore::open(dir.path()).unwrap_err();
+    let err = LocalStore::open(dir.path(), test_key()).unwrap_err();
     assert!(matches!(err, StoreError::Corruption(_)));
 }
 
@@ -149,18 +189,17 @@ fn torn_final_write_is_tolerated() {
     let dir = tempfile::tempdir().unwrap();
     let ops = sample_ops();
     {
-        let mut s = LocalStore::open(dir.path()).unwrap();
+        let mut s = LocalStore::open(dir.path(), test_key()).unwrap();
         for o in &ops {
             s.commit(o).unwrap();
         }
     }
     let log = dir.path().join("ops.jsonl");
     let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
-    f.write_all(b"{\"id\":\"deadbeef\",\"core\":{\"v\":1")
-        .unwrap(); // truncated, no newline
+    f.write_all(b"deadbeef").unwrap(); // truncated final line, no newline
     drop(f);
 
-    let s2 = LocalStore::open(dir.path()).unwrap();
+    let s2 = LocalStore::open(dir.path(), test_key()).unwrap();
     assert_eq!(s2.ops().len(), ops.len());
 }
 

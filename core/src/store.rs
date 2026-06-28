@@ -9,12 +9,16 @@
 //! The outbox (committed-but-unacked ops) is derived from the difference, so
 //! "outbox empty" is structurally distinct from "converged" (master §0.5).
 //!
-//! ponytail: append-only JSONL + fsync is the canonical durable source.
+//! Each op-log line is encrypted at rest under a [`SymKey`] (XChaCha20-Poly1305),
+//! so the on-disk log holds no plaintext (master §2.4, zero-knowledge by default).
+//! The ack log holds only opaque op-id hashes.
+//!
+//! ponytail: append-only encrypted JSONL is the canonical durable source.
 //! SQLite/SQLCipher becomes a *rebuildable* index/projection over this log when
-//! query and at-rest encryption land (ROADMAP S3); the log stays the truth
-//! (master §6.6: derived caches must not replace source truth).
-//! ponytail: plaintext on disk for now; at-rest encryption is ROADMAP S3.
+//! query needs arrive (later ROADMAP); the log stays the truth (master §6.6:
+//! derived caches must not replace source truth).
 
+use crate::crypto::SymKey;
 use crate::envelope::OperationEnvelope;
 use crate::id::OpId;
 use std::collections::BTreeSet;
@@ -48,6 +52,7 @@ impl From<std::io::Error> for StoreError {
 pub struct LocalStore {
     op_log: PathBuf,
     ack_log: PathBuf,
+    key: SymKey,
     ops: Vec<OperationEnvelope>,
     seen: BTreeSet<OpId>,
     acked: BTreeSet<OpId>,
@@ -65,7 +70,10 @@ fn append_line(path: &Path, line: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn load_ops(path: &Path) -> Result<(Vec<OperationEnvelope>, BTreeSet<OpId>), StoreError> {
+fn load_ops(
+    path: &Path,
+    key: &SymKey,
+) -> Result<(Vec<OperationEnvelope>, BTreeSet<OpId>), StoreError> {
     let mut ops = Vec::new();
     let mut seen = BTreeSet::new();
     if !path.exists() {
@@ -79,28 +87,29 @@ fn load_ops(path: &Path) -> Result<(Vec<OperationEnvelope>, BTreeSet<OpId>), Sto
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<OperationEnvelope>(line) {
-            Ok(env) => {
-                if !env.verify_integrity() {
-                    return Err(StoreError::Corruption(format!(
-                        "integrity mismatch at line {}",
-                        i + 1
-                    )));
-                }
-                if seen.insert(env.id.clone()) {
-                    ops.push(env);
-                }
-            }
-            // Append-only means only the final line can be a torn write from a
-            // crash mid-append: tolerate it (the op was never durably acked).
-            // A parse failure anywhere earlier is real corruption.
-            Err(_) if i == last => break,
-            Err(e) => {
+        // Decrypt first. A torn/garbled FINAL line is a crash artifact (tolerate);
+        // a decryption failure anywhere earlier is corruption, a wrong key, or
+        // tampering — the AEAD tag makes that distinction cryptographic.
+        let plaintext = match key.open_line(line) {
+            Some(pt) => pt,
+            None if i == last => break,
+            None => {
                 return Err(StoreError::Corruption(format!(
-                    "parse error at line {}: {e}",
+                    "undecryptable op-log line {}",
                     i + 1
                 )))
             }
+        };
+        let env: OperationEnvelope = serde_json::from_slice(&plaintext)
+            .map_err(|e| StoreError::Corruption(format!("parse error at line {}: {e}", i + 1)))?;
+        if !env.verify_integrity() {
+            return Err(StoreError::Corruption(format!(
+                "integrity mismatch at line {}",
+                i + 1
+            )));
+        }
+        if seen.insert(env.id.clone()) {
+            ops.push(env);
         }
     }
     Ok((ops, seen))
@@ -122,16 +131,19 @@ fn load_acks(path: &Path) -> Result<BTreeSet<OpId>, StoreError> {
 }
 
 impl LocalStore {
-    pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
+    /// Open (or create) the store in `dir`, decrypting its op log under `key`.
+    /// The same key must be supplied on every open of the same store.
+    pub fn open(dir: impl AsRef<Path>, key: SymKey) -> Result<Self, StoreError> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let op_log = dir.join("ops.jsonl");
         let ack_log = dir.join("acks.log");
-        let (ops, seen) = load_ops(&op_log)?;
+        let (ops, seen) = load_ops(&op_log, &key)?;
         let acked = load_acks(&ack_log)?;
         Ok(Self {
             op_log,
             ack_log,
+            key,
             ops,
             seen,
             acked,
@@ -149,8 +161,8 @@ impl LocalStore {
         if self.seen.contains(&env.id) {
             return Ok(false);
         }
-        let line = serde_json::to_string(env).map_err(|e| StoreError::Corruption(e.to_string()))?;
-        append_line(&self.op_log, &line)?;
+        let json = serde_json::to_string(env).map_err(|e| StoreError::Corruption(e.to_string()))?;
+        append_line(&self.op_log, &self.key.seal_line(json.as_bytes()))?;
         self.seen.insert(env.id.clone());
         self.ops.push(env.clone());
         Ok(true)
