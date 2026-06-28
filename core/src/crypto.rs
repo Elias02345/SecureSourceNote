@@ -47,6 +47,17 @@ impl SymKey {
         SymKey(okm)
     }
 
+    /// A public, non-secret tag derived from this key (HKDF-SHA256, hex). One-way,
+    /// so it is safe to expose — e.g. as a server bucket id derived from a shared
+    /// workspace key — without revealing the key itself.
+    pub fn public_tag(&self, info: &[u8]) -> String {
+        let hk = Hkdf::<Sha256>::new(None, &self.0);
+        let mut okm = [0u8; 32];
+        hk.expand(info, &mut okm)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        to_hex(&okm)
+    }
+
     fn cipher(&self) -> XChaCha20Poly1305 {
         XChaCha20Poly1305::new_from_slice(&self.0).expect("32-byte key is valid")
     }
@@ -137,6 +148,14 @@ mod tests {
         let last = sealed.len() - 1;
         sealed[last] ^= 0x01;
         assert!(k.open(&sealed).is_none());
+    }
+
+    #[test]
+    fn public_tag_is_stable_and_separated() {
+        let k = SymKey::from_bytes([8u8; 32]);
+        assert_eq!(k.public_tag(b"x"), k.public_tag(b"x"));
+        assert_ne!(k.public_tag(b"x"), k.public_tag(b"y"));
+        assert_eq!(k.public_tag(b"x").len(), 64);
     }
 
     #[test]

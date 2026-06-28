@@ -1,0 +1,21 @@
+[package]
+name = "ssn-server"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "SecureSourceNote zero-knowledge sync relay."
+
+[lib]
+name = "ssn_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ssn-server"
+path = "src/main.rs"
+
+[dependencies]
+tiny_http = "0.12"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -8,9 +8,10 @@
 //! replace this before any non-dev use; at-rest encryption only helps once the
 //! key lives elsewhere. Marked here so it is not mistaken for production-ready.
 
+use serde_json::json;
 use ssn_core::{
-    replay, BlockId, DeviceId, DocumentId, EnvelopeCore, LocalStore, OperationEnvelope, Payload,
-    SymKey, WorkspaceId, WorkspaceState, ENVELOPE_VERSION,
+    replay, BlockId, DeviceId, DocumentId, EnvelopeCore, LocalStore, OpId, OperationEnvelope,
+    Payload, SymKey, WorkspaceId, WorkspaceState, ENVELOPE_VERSION,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +49,13 @@ pub fn run(args: &[String], home: &Path) -> Result<String, String> {
         "rm" => cmd_rm(home, args.get(1).ok_or("usage: ssn rm <block-id>")?),
         "ls" => cmd_ls(home),
         "cat" => cmd_cat(home, args.get(1).ok_or("usage: ssn cat <doc-id>")?),
+        "pair-code" => cmd_pair_code(home),
+        "pair" => cmd_pair(
+            home,
+            args.get(1).ok_or("usage: ssn pair <workspace-key-hex>")?,
+        ),
+        "push" => cmd_push(home, &server_url(args.get(1))),
+        "pull" => cmd_pull(home, &server_url(args.get(1))),
         "help" | "-h" | "--help" => Ok(usage()),
         other => Err(format!("unknown command '{other}'\n\n{}", usage())),
     }
@@ -64,7 +72,12 @@ fn usage() -> String {
      ssn ls                   list notes\n\
      ssn cat <doc>            print a note\n\
      \n\
-     Data lives in $SSN_HOME (default ./.ssn)."
+     ssn pair-code            print this workspace's sync key (share with another device)\n\
+     ssn pair <key-hex>       adopt a workspace sync key from another device\n\
+     ssn push [server]        send local changes to the sync server\n\
+     ssn pull [server]        fetch remote changes from the sync server\n\
+     \n\
+     Data lives in $SSN_HOME (default ./.ssn). Server default http://127.0.0.1:8787."
         .into()
 }
 
@@ -303,4 +316,123 @@ fn from_hex32(s: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
+}
+
+// --- sync (ROADMAP S5/S6-lite) ----------------------------------------------
+
+fn server_url(arg: Option<&String>) -> String {
+    arg.cloned()
+        .or_else(|| std::env::var("SSN_SERVER").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8787".into())
+}
+
+/// The workspace key is the SHARED sync secret (distinct from the per-device
+/// at-rest store key). Envelopes are sealed under it before they leave the
+/// device, so the relay only ever sees ciphertext.
+fn load_or_create_ws_key(home: &Path) -> Result<SymKey, String> {
+    std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
+    let kp = home.join("workspace.key");
+    if kp.exists() {
+        let hex = std::fs::read_to_string(&kp).map_err(|e| e.to_string())?;
+        Ok(SymKey::from_bytes(
+            from_hex32(hex.trim()).ok_or("corrupt workspace.key")?,
+        ))
+    } else {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes).expect("OS CSPRNG unavailable");
+        let hex: String = bytes.iter().map(|x| format!("{x:02x}")).collect();
+        std::fs::write(&kp, hex).map_err(|e| e.to_string())?;
+        Ok(SymKey::from_bytes(bytes))
+    }
+}
+
+fn cmd_pair_code(home: &Path) -> Result<String, String> {
+    load_or_create_ws_key(home)?; // ensure it exists
+    let hex = std::fs::read_to_string(home.join("workspace.key")).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "workspace sync key (secret — import on another device with `ssn pair`):\n{}",
+        hex.trim()
+    ))
+}
+
+fn cmd_pair(home: &Path, hex: &str) -> Result<String, String> {
+    from_hex32(hex.trim()).ok_or("invalid key: expected 64 hex chars")?;
+    std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
+    std::fs::write(home.join("workspace.key"), hex.trim()).map_err(|e| e.to_string())?;
+    Ok("workspace sync key adopted".into())
+}
+
+fn cmd_push(home: &Path, server: &str) -> Result<String, String> {
+    let wk = load_or_create_ws_key(home)?;
+    let bucket = wk.public_tag(b"ssn-bucket-v1");
+    let mut store = open_store(home)?;
+    let (blobs, ids): (Vec<String>, Vec<OpId>) = {
+        let outbox = store.outbox();
+        (
+            outbox.iter().map(|e| wk.seal_line(&e.to_bytes())).collect(),
+            outbox.iter().map(|e| e.id.clone()).collect(),
+        )
+    };
+    if blobs.is_empty() {
+        return Ok("nothing to push".into());
+    }
+    ureq::post(&format!("{server}/push/{bucket}"))
+        .send_string(&json!({ "blobs": blobs }).to_string())
+        .map_err(|e| format!("push failed: {e}"))?;
+    for id in &ids {
+        store.mark_acked(id).map_err(|e| e.to_string())?;
+    }
+    Ok(format!("pushed {} op(s)", ids.len()))
+}
+
+fn cmd_pull(home: &Path, server: &str) -> Result<String, String> {
+    let wk = load_or_create_ws_key(home)?;
+    let bucket = wk.public_tag(b"ssn-bucket-v1");
+    let cursor = read_cursor(home);
+    let resp = ureq::get(&format!("{server}/pull/{bucket}?since={cursor}"))
+        .call()
+        .map_err(|e| format!("pull failed: {e}"))?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&resp).map_err(|e| e.to_string())?;
+    let new_cursor = v
+        .get("cursor")
+        .and_then(|c| c.as_u64())
+        .unwrap_or(cursor as u64) as usize;
+    let blobs = v
+        .get("blobs")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut store = open_store(home)?;
+    let mut applied = 0usize;
+    for b in &blobs {
+        let line = match b.as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let bytes = wk
+            .open_line(line)
+            .ok_or("cannot decrypt a pulled blob (wrong workspace key?)")?;
+        let env = OperationEnvelope::from_bytes(&bytes).ok_or("malformed pulled envelope")?;
+        if store.commit(&env).map_err(|e| e.to_string())? {
+            applied += 1;
+        }
+        // a pulled op is already on the server — mark it acked so we never bounce it back
+        store.mark_acked(&env.id).map_err(|e| e.to_string())?;
+    }
+    write_cursor(home, new_cursor)?;
+    Ok(format!("pulled {applied} new op(s) (cursor {new_cursor})"))
+}
+
+fn read_cursor(home: &Path) -> usize {
+    std::fs::read_to_string(home.join("pull.cursor"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_cursor(home: &Path, cursor: usize) -> Result<(), String> {
+    std::fs::write(home.join("pull.cursor"), cursor.to_string()).map_err(|e| e.to_string())
 }

@@ -108,6 +108,16 @@ impl OperationEnvelope {
     pub fn verify_integrity(&self) -> bool {
         self.core.content_id() == self.id
     }
+
+    /// Canonical JSON bytes of the full envelope, for sync transport.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("envelope is always serializable")
+    }
+
+    /// Parse an envelope from JSON bytes; `None` if malformed.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        serde_json::from_slice(bytes).ok()
+    }
 }
 
 #[cfg(test)]
@@ -144,5 +154,11 @@ mod tests {
         let mut c = core();
         c.authored_ms = 8;
         assert_ne!(id1, c.content_id());
+    }
+
+    #[test]
+    fn bytes_roundtrip() {
+        let e = OperationEnvelope::seal(core());
+        assert_eq!(OperationEnvelope::from_bytes(&e.to_bytes()), Some(e));
     }
 }

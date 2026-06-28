@@ -16,8 +16,8 @@
 !/Cargo.lock
 !/core/
 !/cli/
-# Future app components — uncomment as they are built (ROADMAP S4/S5):
-# !/server/
+!/server/
+# Future app components — uncomment as they are built (ROADMAP S4):
 # !/clients/
 # !/bindings/
 # !/testkits/
