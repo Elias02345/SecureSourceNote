@@ -15,9 +15,10 @@
 !/Cargo.toml
 !/Cargo.lock
 !/core/
+!/cli/
 # Future app components — uncomment as they are built (ROADMAP S4/S5):
-# !/clients/
 # !/server/
+# !/clients/
 # !/bindings/
 # !/testkits/
 

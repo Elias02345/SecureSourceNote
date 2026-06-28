@@ -1,0 +1,21 @@
+[package]
+name = "ssn-cli"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "SecureSourceNote command-line client."
+
+[lib]
+name = "ssn_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ssn"
+path = "src/main.rs"
+
+[dependencies]
+ssn-core = { path = "../core" }
+getrandom = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
