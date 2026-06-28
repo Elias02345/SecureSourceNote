@@ -1,4 +1,4 @@
-//! ROADMAP S2/S3 exit criteria, as runnable checks (the 03:00-pager-drill seeds).
+//! ROADMAP S2/S3/S6 exit criteria, as runnable checks (the 03:00-pager-drill seeds).
 //! Each test fails if a core trust invariant breaks.
 
 use ssn_core::*;
@@ -9,6 +9,7 @@ fn test_key() -> SymKey {
     SymKey::from_bytes([7u8; 32])
 }
 
+/// A single parentless op (for cases where causality is irrelevant).
 fn op(payload: Payload) -> OperationEnvelope {
     OperationEnvelope::seal(EnvelopeCore {
         v: ENVELOPE_VERSION,
@@ -19,39 +20,58 @@ fn op(payload: Payload) -> OperationEnvelope {
     })
 }
 
+/// Build a causal chain (each op's parent is the previous op) — what a single
+/// device actually produces.
+fn chain(payloads: Vec<Payload>) -> Vec<OperationEnvelope> {
+    let mut out: Vec<OperationEnvelope> = Vec::new();
+    let mut parents: Vec<OpId> = vec![];
+    for (i, payload) in payloads.into_iter().enumerate() {
+        let e = OperationEnvelope::seal(EnvelopeCore {
+            v: ENVELOPE_VERSION,
+            actor: DeviceId::new("dev-a"),
+            parents: parents.clone(),
+            authored_ms: i as i64,
+            payload,
+        });
+        parents = vec![e.id.clone()];
+        out.push(e);
+    }
+    out
+}
+
 fn sample_ops() -> Vec<OperationEnvelope> {
     let ws = WorkspaceId::new("ws1");
     let doc = DocumentId::new("doc1");
     let b1 = BlockId::new("b1");
     let b2 = BlockId::new("b2");
-    vec![
-        op(Payload::CreateWorkspace {
+    chain(vec![
+        Payload::CreateWorkspace {
             workspace: ws.clone(),
             name: "Home".into(),
-        }),
-        op(Payload::CreateDocument {
+        },
+        Payload::CreateDocument {
             workspace: ws,
             document: doc.clone(),
             title: "Note".into(),
-        }),
-        op(Payload::InsertBlock {
+        },
+        Payload::InsertBlock {
             document: doc.clone(),
             block: b1.clone(),
             after: None,
             text: "hello".into(),
-        }),
-        op(Payload::InsertBlock {
+        },
+        Payload::InsertBlock {
             document: doc.clone(),
             block: b2,
             after: Some(b1.clone()),
             text: "world".into(),
-        }),
-        op(Payload::EditBlock {
+        },
+        Payload::EditBlock {
             document: doc,
             block: b1,
             text: "HELLO".into(),
-        }),
-    ]
+        },
+    ])
 }
 
 /// Step 2: local work is durable across a process restart, and replays correctly.
@@ -81,11 +101,60 @@ fn local_save_survives_reopen() {
     assert_eq!(visible, vec!["HELLO", "world"]);
 }
 
-/// Replaying the same ops always yields the same state.
+/// Replay is order-independent: a shuffled op log yields the same state, so two
+/// devices that received ops in different orders still converge (master §0.5).
 #[test]
-fn replay_is_deterministic() {
+fn replay_is_convergent_regardless_of_order() {
     let ops = sample_ops();
-    assert_eq!(replay(&ops), replay(&ops));
+    let mut shuffled: Vec<&OperationEnvelope> = ops.iter().collect();
+    shuffled.reverse();
+    assert_eq!(replay(&ops), replay(shuffled));
+}
+
+/// Concurrent edits to the same block are preserved, never silently overwritten.
+#[test]
+fn concurrent_edits_preserved_as_conflict() {
+    let doc = DocumentId::new("d");
+    let b = BlockId::new("b");
+    let base = chain(vec![
+        Payload::CreateDocument {
+            workspace: WorkspaceId::new("w"),
+            document: doc.clone(),
+            title: "t".into(),
+        },
+        Payload::InsertBlock {
+            document: doc.clone(),
+            block: b.clone(),
+            after: None,
+            text: "base".into(),
+        },
+    ]);
+    let insert_id = base[1].id.clone();
+    // Two edits that both name the insert as their only parent → concurrent.
+    let edit = |actor: &str, ms: i64, text: &str| {
+        OperationEnvelope::seal(EnvelopeCore {
+            v: ENVELOPE_VERSION,
+            actor: DeviceId::new(actor),
+            parents: vec![insert_id.clone()],
+            authored_ms: ms,
+            payload: Payload::EditBlock {
+                document: doc.clone(),
+                block: b.clone(),
+                text: text.into(),
+            },
+        })
+    };
+    let mut ops = base.clone();
+    ops.push(edit("dev-a", 10, "from-A"));
+    ops.push(edit("dev-b", 11, "from-B"));
+
+    let state = replay(&ops);
+    let blk = &state.documents.get(&doc).unwrap().blocks[0];
+    let mut values = vec![blk.text.clone()];
+    values.extend(blk.conflicts.clone());
+    values.sort();
+    assert_eq!(values, vec!["from-A".to_string(), "from-B".to_string()]);
+    assert!(!blk.removed, "a surviving edit keeps the block visible");
 }
 
 /// "Outbox empty" must not be conflatable with "durable": acking changes the
@@ -169,7 +238,6 @@ fn tamper_is_detected_on_reopen() {
             s.commit(o).unwrap();
         }
     }
-    // Flip one hex nibble in the first (non-final) ciphertext line.
     let log = dir.path().join("ops.jsonl");
     let content = std::fs::read_to_string(&log).unwrap();
     let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
@@ -208,23 +276,23 @@ fn torn_final_write_is_tolerated() {
 fn tombstone_retains_history() {
     let doc = DocumentId::new("d");
     let b = BlockId::new("b");
-    let ops = vec![
-        op(Payload::CreateDocument {
+    let ops = chain(vec![
+        Payload::CreateDocument {
             workspace: WorkspaceId::new("w"),
             document: doc.clone(),
             title: "t".into(),
-        }),
-        op(Payload::InsertBlock {
+        },
+        Payload::InsertBlock {
             document: doc.clone(),
             block: b.clone(),
             after: None,
             text: "keep-me".into(),
-        }),
-        op(Payload::RemoveBlock {
+        },
+        Payload::RemoveBlock {
             document: doc.clone(),
             block: b,
-        }),
-    ];
+        },
+    ]);
     let state = replay(&ops);
     let d = state.documents.get(&doc).unwrap();
     assert_eq!(d.blocks.len(), 1, "history retained");

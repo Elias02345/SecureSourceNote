@@ -204,6 +204,9 @@ fn cmd_cat(home: &Path, doc: &str) -> Result<String, String> {
     let mut out = format!("# {}\n", d.title);
     for b in d.blocks.iter().filter(|b| !b.removed) {
         out.push_str(&format!("[{}] {}\n", b.id, b.text));
+        for c in &b.conflicts {
+            out.push_str(&format!("    ! conflicting value: {c}\n"));
+        }
     }
     Ok(out.trim_end().to_string())
 }
