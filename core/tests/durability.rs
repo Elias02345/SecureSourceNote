@@ -298,3 +298,67 @@ fn tombstone_retains_history() {
     assert_eq!(d.blocks.len(), 1, "history retained");
     assert!(d.blocks[0].removed, "but hidden from the live projection");
 }
+
+/// Heads track concurrency; a resolve (edit naming all heads) collapses them.
+#[test]
+fn resolve_collapses_a_conflict() {
+    let doc = DocumentId::new("d");
+    let b = BlockId::new("b");
+    let base = chain(vec![
+        Payload::CreateDocument {
+            workspace: WorkspaceId::new("w"),
+            document: doc.clone(),
+            title: "t".into(),
+        },
+        Payload::InsertBlock {
+            document: doc.clone(),
+            block: b.clone(),
+            after: None,
+            text: "base".into(),
+        },
+    ]);
+    let insert_id = base[1].id.clone();
+    let edit = |actor: &str, ms: i64, text: &str| {
+        OperationEnvelope::seal(EnvelopeCore {
+            v: ENVELOPE_VERSION,
+            actor: DeviceId::new(actor),
+            parents: vec![insert_id.clone()],
+            authored_ms: ms,
+            payload: Payload::EditBlock {
+                document: doc.clone(),
+                block: b.clone(),
+                text: text.into(),
+            },
+        })
+    };
+    let mut ops = base.clone();
+    ops.push(edit("dev-a", 10, "A"));
+    ops.push(edit("dev-b", 11, "B"));
+    assert_eq!(
+        block_heads(&ops, &b).len(),
+        2,
+        "two concurrent edits → two heads"
+    );
+
+    let resolve = OperationEnvelope::seal(EnvelopeCore {
+        v: ENVELOPE_VERSION,
+        actor: DeviceId::new("dev-a"),
+        parents: block_heads(&ops, &b),
+        authored_ms: 20,
+        payload: Payload::EditBlock {
+            document: doc.clone(),
+            block: b.clone(),
+            text: "final".into(),
+        },
+    });
+    ops.push(resolve);
+    assert_eq!(
+        block_heads(&ops, &b).len(),
+        1,
+        "resolve collapses to one head"
+    );
+    let state = replay(&ops);
+    let blk = &state.documents.get(&doc).unwrap().blocks[0];
+    assert_eq!(blk.text, "final");
+    assert!(blk.conflicts.is_empty());
+}

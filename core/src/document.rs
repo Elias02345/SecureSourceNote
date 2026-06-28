@@ -235,3 +235,34 @@ fn resolve_block(
         removed: false,
     }
 }
+
+/// The op-ids currently "live" for a block (its causal heads). An edit that names
+/// all of these as parents supersedes every concurrent value, settling a conflict.
+pub fn block_heads<'a>(
+    ops: impl IntoIterator<Item = &'a OperationEnvelope>,
+    block: &BlockId,
+) -> Vec<OpId> {
+    let mut by_id: HashMap<&OpId, &OperationEnvelope> = HashMap::new();
+    for e in ops {
+        by_id.entry(&e.id).or_insert(e);
+    }
+    let bos: Vec<&OperationEnvelope> = by_id
+        .values()
+        .copied()
+        .filter(|e| {
+            matches!(&e.core.payload,
+                Payload::InsertBlock { block: b, .. }
+                | Payload::EditBlock { block: b, .. }
+                | Payload::RemoveBlock { block: b, .. } if b == block)
+        })
+        .collect();
+    let anc: Vec<HashSet<OpId>> = bos.iter().map(|e| ancestors_of(&e.id, &by_id)).collect();
+    let mut heads: Vec<OpId> = bos
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| !(0..bos.len()).any(|j| j != *i && anc[j].contains(&e.id)))
+        .map(|(_, e)| e.id.clone())
+        .collect();
+    heads.sort();
+    heads
+}

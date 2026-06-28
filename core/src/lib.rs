@@ -18,7 +18,7 @@ pub mod id;
 pub mod store;
 
 pub use crypto::SymKey;
-pub use document::{replay, BlockView, DocumentState, WorkspaceState};
+pub use document::{block_heads, replay, BlockView, DocumentState, WorkspaceState};
 pub use envelope::{EnvelopeCore, OperationEnvelope, Payload, ENVELOPE_VERSION};
 pub use id::{AccountId, BlockId, DeviceId, DocumentId, OpId, WorkspaceId};
 pub use store::{LocalStore, StoreError};

@@ -10,8 +10,8 @@
 
 use serde_json::json;
 use ssn_core::{
-    replay, BlockId, DeviceId, DocumentId, EnvelopeCore, LocalStore, OpId, OperationEnvelope,
-    Payload, SymKey, WorkspaceId, WorkspaceState, ENVELOPE_VERSION,
+    block_heads, replay, BlockId, DeviceId, DocumentId, EnvelopeCore, LocalStore, OpId,
+    OperationEnvelope, Payload, SymKey, WorkspaceId, WorkspaceState, ENVELOPE_VERSION,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,6 +56,17 @@ pub fn run(args: &[String], home: &Path) -> Result<String, String> {
         ),
         "push" => cmd_push(home, &server_url(args.get(1))),
         "pull" => cmd_pull(home, &server_url(args.get(1))),
+        "sync" => cmd_sync(home, &server_url(args.get(1))),
+        "resolve" => {
+            let block = args
+                .get(1)
+                .ok_or("usage: ssn resolve <block-id> <text...>")?;
+            let text = args.get(2..).unwrap_or(&[]).join(" ");
+            if text.is_empty() {
+                return Err("usage: ssn resolve <block-id> <text...>".into());
+            }
+            cmd_resolve(home, block, &text)
+        }
         "help" | "-h" | "--help" => Ok(usage()),
         other => Err(format!("unknown command '{other}'\n\n{}", usage())),
     }
@@ -76,6 +87,8 @@ fn usage() -> String {
      ssn pair <key-hex>       adopt a workspace sync key from another device\n\
      ssn push [server]        send local changes to the sync server\n\
      ssn pull [server]        fetch remote changes from the sync server\n\
+     ssn sync [server]        push then pull in one step\n\
+     ssn resolve <blk> <text> settle a block's conflict to a chosen value\n\
      \n\
      Data lives in $SSN_HOME (default ./.ssn). Server default http://127.0.0.1:8787."
         .into()
@@ -438,4 +451,34 @@ fn read_cursor(home: &Path) -> usize {
 
 fn write_cursor(home: &Path, cursor: usize) -> Result<(), String> {
     std::fs::write(home.join("pull.cursor"), cursor.to_string()).map_err(|e| e.to_string())
+}
+
+fn cmd_sync(home: &Path, server: &str) -> Result<String, String> {
+    let pushed = cmd_push(home, server)?;
+    let pulled = cmd_pull(home, server)?;
+    Ok(format!("{pushed}; {pulled}"))
+}
+
+/// Settle a conflict: commit an edit that names every current head of the block
+/// as a parent, so it causally supersedes all concurrent values.
+fn cmd_resolve(home: &Path, block: &str, text: &str) -> Result<String, String> {
+    let device = device_id(home)?;
+    let mut store = open_store(home)?;
+    let blockid = BlockId::new(block);
+    let doc = find_doc_of_block(&replay(store.ops()), &blockid)
+        .ok_or_else(|| format!("no such block: {block}"))?;
+    let parents = block_heads(store.ops(), &blockid);
+    let env = OperationEnvelope::seal(EnvelopeCore {
+        v: ENVELOPE_VERSION,
+        actor: device,
+        parents,
+        authored_ms: now_ms(),
+        payload: Payload::EditBlock {
+            document: doc,
+            block: blockid,
+            text: text.into(),
+        },
+    });
+    store.commit(&env).map_err(|e| e.to_string())?;
+    Ok(format!("resolved {block}"))
 }
