@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["core"]
+
+# ponytail: single-crate workspace today; clients/, server/, bindings/ join as
+# they are built (ROADMAP S4/S5). The monorepo shape is decided, so the
+# workspace is real structure, not speculative scaffolding.

@@ -1,0 +1,29 @@
+# SecureSourceNote — GitHub tracks ONLY the application code.
+#
+# All specification, research, planning, graphify, and scratch artifacts
+# (the *.md corpus, deepresearch/, gemini/, harness/, AGENT_MEMORY.md,
+# SecureSourceNote_MASTER_IDEA.md, ROADMAP.md, CLAUDE.md, scratch/, graphify-out/, …)
+# stay local and are intentionally NOT published. They remain on disk for
+# development; they are simply never committed.
+
+# 1) Ignore everything at the repo root by default.
+/*
+
+# 2) Re-include only the application + repo-hygiene files.
+!/.gitignore
+!/.gitattributes
+!/Cargo.toml
+!/Cargo.lock
+!/core/
+# Future app components — uncomment as they are built (ROADMAP S4/S5):
+# !/clients/
+# !/server/
+# !/bindings/
+# !/testkits/
+
+# 3) Never track build output, env, or secrets, even under allowed dirs.
+target/
+.env
+*.env
+*.key
+*.seed
